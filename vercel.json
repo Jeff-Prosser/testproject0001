@@ -1,5 +1,5 @@
 {
   "crons": [
-    { "path": "/api/capywx?lat=34.181192&lon=-118.326807", "schedule": "*/60 * * * *" }
+    { "path": "/api/capywx?lat=34.181192&lon=-118.326807", "schedule": "0 17 * * *" }
   ]
 }
