@@ -18,7 +18,6 @@
 
 // ======================== app/api/capywx/route.ts ========================
 import OpenAI from "openai";
-import { list, put } from "@vercel/blob";
 
 export const runtime = "nodejs"; // more compatible with Buffer than edge
 export const dynamic = "force-dynamic"; // always compute fresh-ish (cache via headers)
@@ -37,41 +36,34 @@ if (!PIRATE_WEATHER_KEY) {
 
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
+// ---- Types for Pirate Weather ----
+type PirateCurrently = {
+  time?: number;
+  icon?: string;
+  summary?: string;
+  precipIntensity?: number;
+  precipProbability?: number;
+  precipType?: string;
+  temperature?: number;
+  windSpeed?: number;
+  windGust?: number;
+  windBearing?: number;
+  cloudCover?: number;
+  uvIndex?: number;
+};
+
+type PirateDaily0 = {
+  sunriseTime?: number;
+  sunsetTime?: number;
+  moonPhase?: number;
+};
+
+type PirateWeatherResponse = {
+  currently?: PirateCurrently;
+  daily?: { data?: PirateDaily0[] };
+};
+
 // ---------- Helpers ----------
-function bucket<T>(x: number, edges: number[], labels: T[]): T {
-  for (let i = 0; i < edges.length; i++) if (x < edges[i]) return labels[i];
-  return labels[labels.length - 1];
-}
-
-function cacheKeyFromConditions(params: {
-  lat: string; lon: string; isNight: boolean; cloud: number;
-  precipType?: string; precipIntensity?: number; precipProb?: number;
-  windSpeed?: number; windGust?: number; tempF?: number; moonPhase?: number; now?: number;
-}): { filename: string } {
-  const lat2 = Number(params.lat).toFixed(2);
-  const lon2 = Number(params.lon).toFixed(2);
-
-  const cloudB = bucket(params.cloud ?? 0, [0.1, 0.3, 0.6, 0.9], ["clr","mc","pc","mc2","ov"]);
-  const pType = (params.precipType ?? "none").toLowerCase();
-  const pi = params.precipIntensity ?? 0;
-  const pp = params.precipProb ?? 0;
-  let pBucket = "none";
-  if (!(pType === "none" || (pi <= 0.01 && pp < 0.2))) {
-    if (pType === "snow") pBucket = pi > 0.3 ? "snowH" : pi > 0.1 ? "snowM" : "snowL";
-    else if (pType === "sleet") pBucket = "sleet";
-    else pBucket = pi > 0.3 ? "rainH" : pi > 0.1 ? "rainM" : "rainL";
-  }
-  const ws = params.windSpeed ?? 0, wg = params.windGust ?? 0;
-  const windy = ws >= 30 || wg >= 40 ? "vwind" : ws >= 20 || wg >= 30 ? "wind" : ws >= 10 ? "brz" : "calm";
-  const t = params.tempF ?? 70;
-  const tB = t <= 45 ? "cold" : t <= 60 ? "mild" : t >= 92 ? "hot" : "ok";
-  const mB = params.isNight ? (params.moonPhase == null ? "nm" : Math.round((params.moonPhase % 1) * 8).toString()) : "day";
-  const slot = params.now ? Math.floor(params.now / (30 * 60)) : 0; // roll every 30m
-
-  const key = [params.isNight ? "n" : "d", cloudB, pBucket, windy, tB, mB, slot].join("_");
-  return { filename: `capywx/${lat2}_${lon2}/${key}.png` };
-}
-
 function cloudLabel(cc?: number): string {
   const c = typeof cc === "number" ? Math.max(0, Math.min(1, cc)) : 0;
   if (c < 0.1) return "clear sky";
@@ -161,7 +153,6 @@ function buildPrompt({
   windText,
   windCue,
   tempF,
-  uvIndex,
   moonText,
   props,
 }: {
@@ -171,7 +162,6 @@ function buildPrompt({
   windText: string;
   windCue: string;
   tempF: number;
-  uvIndex: number;
   moonText: string;
   props: string;
 }): string {
@@ -202,7 +192,7 @@ async function fetchPirateWeather(lat: string, lon: string) {
 
   const res = await fetch(url.toString(), { next: { revalidate: 0 } });
   if (!res.ok) throw new Error(`Pirate Weather error: ${res.status}`);
-  return (await res.json()) as any;
+  return (await res.json()) as PirateWeatherResponse;
 }
 
 export async function GET(req: Request) {
@@ -241,34 +231,6 @@ export async function GET(req: Request) {
       isNight,
     });
 
-    // build cache key (do this after you've read the weather fields)
-    const { filename } = cacheKeyFromConditions({
-      lat, lon, isNight,
-      cloud: cur.cloudCover ?? 0,
-      precipType: cur.precipType,
-      precipIntensity: cur.precipIntensity,
-      precipProb: cur.precipProbability,
-      windSpeed: cur.windSpeed, windGust: cur.windGust,
-      tempF: cur.temperature, moonPhase: daily0.moonPhase, now
-    });
-
-    // 1) Try cache (Vercel Blob)
-    try {
-      const listed = await list({ prefix: filename });
-      if (listed?.blobs?.length) {
-        const url = listed.blobs[0].url;
-        const cached = await fetch(url);
-        const body = await cached.arrayBuffer();
-        return new Response(body, {
-          status: 200,
-          headers: {
-            "Content-Type": cached.headers.get("content-type") || "image/png",
-            "Cache-Control": "public, s-maxage=300, stale-while-revalidate=86400",
-          },
-        });
-      }
-    } catch { /* no blob locally? fall through to generate */ }
-
     const prompt = buildPrompt({
       isNight,
       cloudText,
@@ -276,41 +238,35 @@ export async function GET(req: Request) {
       windText: wind.text,
       windCue: wind.cue,
       tempF: cur.temperature ?? 70,
-      uvIndex: cur.uvIndex ?? 0,
       moonText: moonLabel(daily0.moonPhase),
       props,
     });
 
-    const img = await openai.images.generate({ model: "gpt-image-1", prompt, size: "1024x1024" });
+    const img = await openai.images.generate({
+      model: "gpt-image-1",
+      prompt,
+      size: "1024x1024",
+    });
 
     const b64 = img.data?.[0]?.b64_json;
     if (!b64) throw new Error("OpenAI image generation returned no data");
 
     const bytes = Buffer.from(b64, "base64");
 
-    // 2) Save to Blob for next time
-    try {
-      await put(filename, bytes, {
-        access: "public",
-        contentType: "image/png",
-        addRandomSuffix: false, // keep predictable key
-      });
-    } catch { /* fine in local dev without token */ }
-
     return new Response(bytes, {
       status: 200,
       headers: {
         "Content-Type": "image/png",
         // Cache at the Vercel edge for 5 minutes, let clients reuse stale for a day
-        "Cache-Control": "public, s-maxage=300, stale-while-revalidate=86400",
+        "Vercel-CDN-Cache-Control": "max-age=43200", // 12 hours at Vercel edge
+        "CDN-Cache-Control": "max-age=43200",    // 12 hours for other CDNs (if any)
+        "Cache-Control": "max-age=300",          // 5 minutes in the browser
       },
     });
-  } catch (err: any) {
+  } catch (err: unknown) {
     console.error(err);
-    return new Response(
-      `Capybara weather image error: ${err?.message ?? "unknown"}`,
-      { status: 500 }
-    );
+    const msg = err instanceof Error ? err.message : String(err);
+    return new Response(`Capybara weather image error: ${msg}`, { status: 500 });
   }
 }
 
